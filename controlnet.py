@@ -3,9 +3,14 @@
     # https://github.com/huggingface/diffusers/blob/v0.27.2/src/diffusers/models/autoencoders/autoencoder_kl.py
     # https://huggingface.co/docs/diffusers/main/en/quicktour
     # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
+    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets/unet_2d_condition.py
+    # https://wandb.ai/johnowhitaker/midu-guidance/reports/Mid-U-Guidance-Fast-Classifier-Guidance-for-Latent-Diffusion-Models--VmlldzozMjg0NzA1
+    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets/unet_2d_blocks.py
 
 import torch
 from diffusers import DiffusionPipeline # 0.27.2
+# import diffusers
+# diffusers.__version__
 from tqdm import tqdm
 import PIL.Image
 import numpy as np
@@ -33,14 +38,14 @@ def display_sample(sample, i):
     image_processed = (image_processed + 1.0) * 127.5
     image_processed = image_processed.numpy().astype(np.uint8)
 
-    image_pil = PIL.Image.fromarray(image_processed[0])
+    image_pil = PIL.Image.fromarray(image_processed`[0]`)
     print(f"Image at step {i}")
     image_pil.show()
 
 
 # device = torch.device("cpu")
-# device = torch.device("mps")
-device = torch.device("cuda")
+device = torch.device("mps")
+# device = torch.device("cuda")
 sd = DiffusionPipeline.from_pretrained(
     "CompVis/stable-diffusion-v1-4",
     torch_dtype=torch.float16,
@@ -121,14 +126,15 @@ with torch.no_grad():
     elif prompt is not None and isinstance(prompt, list):
         batch_size = len(prompt)
     else:
-        batch_size = prompt_embeds.shape[0]
+        batch_size = prompt_embeds.shape`[0]`
 
     device = sd._execution_device
 
     # 3. Encode input prompt
-    lora_scale = (
-        sd.cross_attention_kwargs.get("scale", None) if sd.cross_attention_kwargs is not None else None
-    )
+    if sd.cross_attention_kwargs is not None:
+        lora_scale = sd.cross_attention_kwargs.get("scale", None)
+    else:
+        lora_scale = None
 
     prompt_embeds, negative_prompt_embeds = sd.encode_prompt(
         prompt,
@@ -192,7 +198,8 @@ with torch.no_grad():
     if sd.unet.config.time_cond_proj_dim is not None:
         guidance_scale_tensor = torch.tensor(sd.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
         timestep_cond = sd.get_guidance_scale_embedding(
-            guidance_scale_tensor, embedding_dim=sd.unet.config.time_cond_proj_dim
+            guidance_scale_tensor,
+            embedding_dim=sd.unet.config.time_cond_proj_dim,
         ).to(device=device, dtype=latents.dtype)
 
     # 7. Denoising loop
@@ -203,9 +210,14 @@ with torch.no_grad():
             if sd.interrupt:
                 continue
 
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2) if sd.do_classifier_free_guidance else latents
-            latent_model_input = sd.scheduler.scale_model_input(latent_model_input, t)
+            # Expand the latents if we are doing classifier free guidance
+            if sd.do_classifier_free_guidance:
+                latent_model_input = torch.cat([latents] * 2)
+            else:
+                latent_model_input = latents
+            latent_model_input = sd.scheduler.scale_model_input(
+                latent_model_input, t,
+            )
 
             # predict the noise residual
             noise_pred = sd.unet(
@@ -216,7 +228,7 @@ with torch.no_grad():
                 cross_attention_kwargs=sd.cross_attention_kwargs,
                 added_cond_kwargs=added_cond_kwargs,
                 return_dict=False,
-            )[0]
+            )`[0]`
 
             # perform guidance
             if sd.do_classifier_free_guidance:
@@ -228,7 +240,7 @@ with torch.no_grad():
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=sd.guidance_rescale)
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = sd.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+            latents = sd.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)`[0]`
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
@@ -252,7 +264,7 @@ with torch.no_grad():
             latents / sd.vae.config.scaling_factor,
             return_dict=False,
             generator=generator,
-        )[0]
+        )`[0]`
         image, has_nsfw_concept = sd.run_safety_checker(
             image, device, prompt_embeds.dtype,
         )
@@ -261,7 +273,7 @@ with torch.no_grad():
         has_nsfw_concept = None
 
     if has_nsfw_concept is None:
-        do_denormalize = [True] * image.shape[0]
+        do_denormalize = [True] * image.shape`[0]`
     else:
         do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
@@ -270,7 +282,7 @@ with torch.no_grad():
     # Offload all models
     sd.maybe_free_model_hooks()
 
-    image[0].show()
+    image`[0]`.show()
 
 
 def lock_net(net):
@@ -292,7 +304,7 @@ class ControlNet(nn.Module):
     $\mathcal{Z}(\cdot; \cdot)$ is a 1 × 1 convolution layer with both weight
     and bias initialized to zeros."
     
-    "we use two instances of zero convolutions with parameters Θz1 and Θz2 respectively. The complete ControlNet then computes yc = F(x; Θ) + Z(F(x + Z(c; Θz1 ); Θc ); Θz2 ), (2) where yc is the output of the ControlNet block. In the first training step, since both the weight and bias parameters of a zero convolution layer are initialized to zero, both of the Z(\cdot; \cdot) terms in Equation (2) evaluate to zero, and yc = y."
+    "we use two instances of zero convolutions with parameters Θz1 and Θz2 respectively. The complete ControlNet then computes yc = F(x; Θ) + Z(F(x + Z(c; Θz1 ); Θc ); Θz2 ), (2) where yc is the output of the ControlNet block. In the first training step, since both the weight and bias parameters of a zero convolution layer are initialized to zero, both of the Z(\cdot; \cdot) terms in Equation (2) evaluate to zero, and $y_{c} = y$."
     """
     @staticmethod
     def zero_init_conv(conv):
@@ -319,5 +331,46 @@ controlnet = ControlNet(net=net, channels=channels)
 x = torch.randn((1, 3, 512, 512))
 cond = torch.randn((1, 3, 512, 512))
 out = controlnet(x, cond=cond)
+out.shape
+"""
+"Text prompts are encoded using the CLIP text encoder [66], and diffusion timesteps are encoded with a time encoder using positional encoding."
 
-zero_conv1 = nn.Conv2d(channels, channels, 1, 1, 0)
+"particular, we use ControlNet to create a trainable copy of the 12 encoding blocks and 1 middle block of Stable Diffusion. The 12 encoding blocks are in 4 resolutions (64 × 64, 32 × 32, 16 × 16, 8 × 8) with each one replicated 3 times. The outputs are added to the 12 skip-connections and 1 middle block of the U-net."
+"""
+
+# ├── `down_blocks`
+# │   ├── `[0]`: 'SD Encoder Block A' (`CrossAttnDownBlock2d`)
+# │   │   ├── `resnets`
+# │   │   │   └── `[0]`: 'Resnet layer' (`ResnetBlock2D`)
+# │   │   ├── `attentions`
+# │   │   │   └── `[0]`: 'ViT' (`Transformer2DModel`)
+# │   │   ├── `resnets`
+# │   │   │   └── `[1]` 'Resnet layer' (`ResnetBlock2D`)
+# │   │   ├── `attentions`
+# │   │   │   └── `[1]`: 'ViT' (`Transformer2DModel`)
+# │   │   └── `downsamplers`:
+# │   │       └── `[0]`: 'Down-sampling convolution layer' (`Downsample2D`)
+# │   ├── `[1]`: 'SD Encoder Block B' (`CrossAttnDownBlock2d`)
+# │   │   ...
+# │   ├── `[2]`: 'SD Encoder Block C' (`CrossAttnDownBlock2d`)
+# │   │   ...
+# │   └── `[3]`: 'SD Encoder' (`DownBlock2D`)
+# │       └── `resnets` # 11
+# ├── `mid_block`: 'SD Middle' (`UNetMidBlock2DCrossAttn`)
+#     ...
+# └── `up_blocks`
+#     ...
+
+
+unet = sd.unet
+len(unet.down_blocks[0].attentions)
+unet.config.layers_per_block
+unet.config.transformer_layers_per_block
+
+unet.conv_in
+unet.time_proj
+unet.time_embedding
+# [i`[0]` for i in list(unet.down_blocks`[0]`.named_children())]
+
+unet.mid_block
+unet.up_blocks
