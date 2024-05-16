@@ -1,15 +1,19 @@
 # References:
     # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
-
+import sys
+sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/Peekaboo")
 import torch
 import torch.nn as nn
+from torch.optim import SGD
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 import einops
 from diffusers import DiffusionPipeline # 0.27.2
 from PIL import Image
 import random
+from tqdm import tqdm
 
-from utils import unload_from_gpu
+from utils import unload_from_gpu, denorm
 
 
 class LearnableAlphaMask(nn.Module):
@@ -29,14 +33,6 @@ class LearnableAlphaMask(nn.Module):
         )
 
 
-def get_alpha_reg_loss(alpha_mask):
-    """
-    "$\mathcal{L}_{\alpha} = \sum_{i}\alpha_{i}$, $i$ indexes pixel location in
-    $\alpha$.
-    """
-    return torch.sum(alpha_mask, dim=(-2, -1))
-
-
 def get_rand_uint8_color():
     return (
         random.randint(0, 255), random.randint(0, 255), random.randint(0, 255),
@@ -47,29 +43,7 @@ def get_rand_uint8_color_pil_image(h, w):
     return Image.new("RGB", size=(w, h), color=get_rand_uint8_color())
 
 
-def compose(image, alpha_mask):
-    transform = T.Compose(
-        [T.ToTensor(), T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))],
-    )
-    _, _, h, w = image.shape
-    bg = get_rand_uint8_color_pil_image(h=h, w=w)
-    bg = transform(bg)
-    bg = bg[None, ...]
-    return torch.lerp(
-        image, bg.to(image.device), alpha_mask(channels=3).to(image.device),
-    )
-
-if __name__ == "__main__":
-    # alpha_mask = torch.rand((1, 2, 3))
-    device = torch.device("mps")
-    # device = torch.device("cuda")
-    sd = DiffusionPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4",
-        # torch_dtype=torch.float16,
-        use_safetensors=True,
-    ).to(device)
-    # unload_from_gpu(sd)
-    
+class Peekaboo(nn.Module):
     """
     "We first degrade latent vector $z$ of composite image $x$ using forward
     diffusion, introducing Gaussian noise $\epsilon \sim N$ to $z$, resulting in
@@ -80,54 +54,138 @@ if __name__ == "__main__":
     = \text{MSE}(\epsilon, \mathcal{D}(\tilde{z}, \mathcal{T}(p)))$ where
     $\text{MSE}$ refers to mean-squared loss."
     """
-    sd.config
+    def compose(self):
+        image = Image.open(self.img_path).convert("RGB")
+        image = self.transform(image)
+        image = self.to_tensor_and_norm(image)[None, ...]
+
+        _, _, h, w = image.shape
+        bg = get_rand_uint8_color_pil_image(h=h, w=w)
+        bg = self.to_tensor_and_norm(bg)[None, ...]
+        
+        return torch.lerp(
+            image, bg, self.alpha_mask(channels=3),
+        )
+
+    def __init__(self, sd, img_path, prompt):
+        super().__init__()
+
+        self.sd = sd
+        self.img_path = img_path
+        self.prompt = prompt
+
+
+        self.img_size = sd.unet.config.sample_size * sd.vae_scale_factor
+        self.alpha_mask = LearnableAlphaMask(h=self.img_size, w=self.img_size)
+        self.transform = T.Compose(
+            [
+                T.Resize((self.img_size), antialias=True),
+                T.CenterCrop((self.img_size)),
+            ]
+        )
+        self.to_tensor_and_norm = T.Compose(
+            [
+                T.ToTensor(),
+                T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ]
+        )
+        self.comp_image = self.compose()
+
+        self.prompt_embed = self.get_prompt_embed()
+
+    def get_prompt_embed(self):
+        prompt_embed, _ = self.sd.encode_prompt( # "$\mathcal{T}(p)$"
+            prompt=self.prompt, # "$p$"
+            device=self.sd.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=False,
+            negative_prompt=None,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            lora_scale=None,
+            clip_skip=None,
+        )
+        return prompt_embed
+
+    def get_alpha_reg_loss(self):
+        """
+        "$\mathcal{L}_{\alpha} = \sum_{i}\alpha_{i}$, $i$ indexes pixel location in
+        $\alpha$.
+        """
+        return torch.sum(self.alpha_mask.alpha, dim=(-2, -1))
+
+    def get_score_distil_loss(self):
+        comp_image_latent = self.sd.vae.encode(
+            self.comp_image.to(dtype=sd.dtype, device=self.sd.device),
+        ).latent_dist.mode()# "$z$"
+        rand_noise = self.sd.prepare_latents(
+            batch_size=1,
+            num_channels_latents=self.sd.unet.config.in_channels,
+            height=self.img_size,
+            width=self.img_size,
+            dtype=self.sd.dtype,
+            device=self.sd.device,
+            generator=None,
+            latents=None,
+        ) # "$\epsilon$"
+        rand_timestep = torch.randint(
+            0, self.sd.scheduler.config.num_train_timesteps, size=(1,), device=self.sd.device,
+        )
+        noisy_comp_image_latent = self.sd.scheduler.add_noise(
+            original_samples=comp_image_latent,
+            noise=rand_noise,
+            timesteps=rand_timestep,
+        )
+
+        with torch.no_grad():
+            pred_noise = self.sd.unet(
+                sample=noisy_comp_image_latent,
+                timestep=rand_timestep,
+                encoder_hidden_states=self.prompt_embed,
+                timestep_cond=None,
+                cross_attention_kwargs=None,
+                added_cond_kwargs=None,
+                return_dict=False,
+            )[0] # "$\mathcal{D}$"
+        return torch.sum((rand_noise - pred_noise) ** 2)
+
+    def get_loss(self):
+        return self.get_alpha_reg_loss() + self.get_score_distil_loss()
+
+    def optimize(self, num_steps, lr):
+        optim = SGD(self.alpha_mask.parameters(), lr=lr)
+        for _ in tqdm(range(num_steps)):
+            # loss = self.get_loss()
+            reg_loss = self.get_alpha_reg_loss()
+            score_distil_loss = self.get_score_distil_loss()
+            loss = reg_loss + score_distil_loss
+            # loss = reg_loss
+            log = f"[ {reg_loss.item():.3f} ]"
+            log += f"[ {score_distil_loss.item():.3f} ]"
+            log += f"[ {loss.item():.3f} ]"
+            print(log)
+
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
+        return self.alpha_mask.alpha
+
+
+if __name__ == "__main__":
+    device = torch.device("mps")
+    torch_dtype = torch.float32
+    sd = DiffusionPipeline.from_pretrained(
+        "CompVis/stable-diffusion-v1-4",
+        torch_dtype=torch_dtype,
+        use_safetensors=True,
+    ).to(device)
+    # unload_from_gpu(sd)
+
+    img_path = "/Users/jongbeomkim/Desktop/workspace/Peekaboo/resources/harry_potter.webp"
+    prompt = "Harry Potter"
+    peekaboo = Peekaboo(sd=sd, img_path=img_path, prompt=prompt)
     
-    img_size = 224
-    comp_image = torch.randn((1, 3, img_size, img_size), dtype=torch.float16, device=device) # $x$
-    comp_image_latent = sd.vae.encode(comp_image).latent_dist.mode() # $z$
-    comp_image_latent.shape
+    alpha = peekaboo.optimize(num_steps=50, lr=0.00001)
 
-    alpha_mask = LearnableAlphaMask(h=img_size, w=img_size).to(device)
-    comp_image = compose(image, alpha_mask)
-
-    sd.encode_image(comp_image)
-    
-    batch_size = 1
-    num_images_per_prompt = 1
-    num_channels_latents = sd.unet.config.in_channels
-    height = sd.unet.config.sample_size * sd.vae_scale_factor
-    width = sd.unet.config.sample_size * sd.vae_scale_factor
-    generator = None
-    latents = None
-
-    prompt = "Harry potter"
-    do_classifier_free_guidance = False
-    negative_prompt = None
-    prompt_embeds = None
-    negative_prompt_embeds = None
-    cross_attention_kwargs = None
-    lora_scale = None
-    clip_skip = None
-    prompt_embed, _ = sd.encode_prompt(
-        prompt,
-        device,
-        num_images_per_prompt,
-        do_classifier_free_guidance,
-        negative_prompt,
-        prompt_embeds=prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
-        lora_scale=lora_scale,
-        clip_skip=clip_skip,
-    )
-
-    latents = sd.prepare_latents(
-        batch_size * num_images_per_prompt,
-        num_channels_latents,
-        height,
-        width,
-        prompt_embed.dtype,
-        device,
-        generator,
-        latents,
-    )
-    latents.shape
+    temp = torch.sigmoid(peekaboo.alpha_mask.alpha)
+    TF.to_pil_image(temp).show()
