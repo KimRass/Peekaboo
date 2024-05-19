@@ -80,10 +80,10 @@ class Peekaboo(nn.Module):
         = \text{MSE}(\epsilon, \mathcal{D}(\tilde{z}, \mathcal{T}(p)))$ where
         $\text{MSE}$ refers to mean-squared loss."
         """
-        with torch.no_grad():
-            comp_image_latent = self.sd.vae.encode(
-                comp_image.to(dtype=sd.dtype, device=self.sd.device),
-            ).latent_dist.mode() # "$z$"
+        # with torch.no_grad():
+        comp_image_latent = self.sd.vae.encode(
+            comp_image.to(dtype=sd.dtype, device=self.sd.device),
+        ).latent_dist.mode() # "$z$"
         rand_noise = self.sd.prepare_latents(
             batch_size=1,
             num_channels_latents=self.sd.unet.config.in_channels,
@@ -103,16 +103,16 @@ class Peekaboo(nn.Module):
             timesteps=rand_timestep,
         ) # "$\tilde{z}$"
         # with torch.inference_mode():
-        with torch.no_grad():
-            pred_noise = self.sd.unet(
-                sample=noisy_comp_image_latent,
-                timestep=rand_timestep,
-                encoder_hidden_states=prompt_embed,
-                timestep_cond=None,
-                cross_attention_kwargs=None,
-                added_cond_kwargs=None,
-                return_dict=False,
-            )[0] # "$\hat{\epsilon}$"
+        # with torch.no_grad():
+        pred_noise = self.sd.unet(
+            sample=noisy_comp_image_latent,
+            timestep=rand_timestep,
+            encoder_hidden_states=prompt_embed,
+            timestep_cond=None,
+            cross_attention_kwargs=None,
+            added_cond_kwargs=None,
+            return_dict=False,
+        )[0] # "$\hat{\epsilon}$"
         return torch.sum((rand_noise - pred_noise) ** 2)
 
     @staticmethod
@@ -157,6 +157,8 @@ class Peekaboo(nn.Module):
     def optimize(self, img_path, prompt, num_steps, lr):
         image = self.get_image(img_path)
         prompt_embed = self.get_prompt_embed(prompt)
+        comp_image = self.get_composite_image(image)
+        image_to_grid(comp_image, 1).show()
 
         optim = SGD(self.alpha_mask.parameters(), lr=lr)
         for _ in tqdm(range(num_steps)):
@@ -165,7 +167,8 @@ class Peekaboo(nn.Module):
             score_distil_loss = self.get_score_distil_loss(
                 comp_image=comp_image, prompt_embed=prompt_embed,
             )
-            loss = reg_loss + score_distil_loss
+            # loss = reg_loss + score_distil_loss
+            loss = score_distil_loss
 
             log = f"[ {reg_loss.item():.3f} ]"
             log += f"[ {score_distil_loss.item():.3f} ]"
@@ -196,6 +199,3 @@ if __name__ == "__main__":
         img_path=img_path, prompt=prompt, num_steps=50, lr=0.00001,
     )
     image_to_grid(comp_image, 1).show()
-
-    # temp = torch.sigmoid(peekaboo.alpha_mask.alpha)
-    # TF.to_pil_image(temp).show()
