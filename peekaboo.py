@@ -1,7 +1,7 @@
 # References:
     # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
 import sys
-sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/Peekaboo")
+sys.path.insert(0, "/home/jongbeomkim/Documents/workspace/Peekaboo")
 import torch
 import torch.nn as nn
 from torch.optim import SGD
@@ -16,7 +16,7 @@ from tqdm import tqdm
 from utils import unload_from_gpu, image_to_grid
 
 
-class LearnableAlphaMask(nn.Module):
+class AlphaMask(nn.Module):
     """
     "We use a randomly initialized alpha mask ($\alpha$) to alpha-blend the
     puppy image ($x$) with different backgrounds ($b$), generating new composite
@@ -26,7 +26,7 @@ class LearnableAlphaMask(nn.Module):
     def __init__(self, h, w):
         super().__init__()
 
-        self.alpha = nn.Parameter(torch.randn(h, w))
+        self.param = nn.Parameter(torch.randn(h, w))
 
     def forward(self, channels):
         """
@@ -34,7 +34,7 @@ class LearnableAlphaMask(nn.Module):
         and 1 using a sigmoid function."
         """
         return einops.repeat(
-            torch.sigmoid(self.alpha), pattern="h w -> 1 c h w", c=channels,
+            torch.sigmoid(self.param), pattern="h w -> 1 c h w", c=channels,
         )
 
 
@@ -47,7 +47,7 @@ class Peekaboo(nn.Module):
         self.sd.unet.eval()
 
         self.img_size = sd.unet.config.sample_size * sd.vae_scale_factor
-        self.alpha_mask = LearnableAlphaMask(h=self.img_size, w=self.img_size)
+        self.alpha_mask = AlphaMask(h=self.img_size, w=self.img_size)
         self.transform = T.Compose(
             [
                 T.Resize((self.img_size), antialias=True),
@@ -66,7 +66,11 @@ class Peekaboo(nn.Module):
         "$\mathcal{L}_{\alpha} = \sum_{i}\alpha_{i}$, $i$ indexes pixel location in
         $\alpha$.
         """
-        return torch.sum(self.alpha_mask.alpha, dim=(-2, -1))
+        # return torch.sum(self.alpha_mask.param, dim=(-2, -1))
+        # return torch.sum(
+        #     torch.sigmoid(self.alpha_mask.param), dim=(-2, -1),
+        # )
+        return torch.sum(torch.sigmoid(self.alpha_mask.param))
 
     def get_score_distil_loss(self, comp_image, prompt_embed):
         """
@@ -95,7 +99,10 @@ class Peekaboo(nn.Module):
             latents=None,
         ) # "$\epsilon$"
         rand_timestep = torch.randint(
-            0, self.sd.scheduler.config.num_train_timesteps, size=(1,), device=self.sd.device,
+            0,
+            self.sd.scheduler.config.num_train_timesteps,
+            size=(1,),
+            device=self.sd.device,
         )
         noisy_comp_image_latent = self.sd.scheduler.add_noise(
             original_samples=comp_image_latent,
@@ -121,13 +128,14 @@ class Peekaboo(nn.Module):
             mode="RGB",
             size=(w, h),
             color=(
-                random.randint(0, 255),
-                random.randint(0, 255),
-                random.randint(0, 255),
+                # random.randint(0, 255),
+                # random.randint(0, 255),
+                # random.randint(0, 255),
+                100, 100, 100,
             ),
         )
 
-    def get_image(self, img_path):
+    def prepare_image(self, img_path):
         image = Image.open(img_path).convert("RGB")
         image = self.transform(image)
         return self.to_tensor_and_norm(image)[None, ...]
@@ -152,38 +160,52 @@ class Peekaboo(nn.Module):
         _, _, h, w = image.shape
         bg = self.get_rand_uint8_color_bg(h=h, w=w)
         bg = self.to_tensor_and_norm(bg)[None, ...]        
-        return torch.lerp(image, bg, self.alpha_mask(channels=3))
+        return torch.lerp(bg, image, self.alpha_mask(channels=3))
 
-    def optimize(self, img_path, prompt, num_steps, lr):
-        image = self.get_image(img_path)
+    def optimize(
+        self, img_path, prompt, num_iters=200, lr=1e-5, reg_coeff=0.05,
+    ):
+        """
+        In order to generate a single segmentation, we run it for 200 terations,
+        a learning rate of 1e - 5, and stochastic gradient descent as the
+        optimizer.
+        """
+        image = self.prepare_image(img_path)
         prompt_embed = self.get_prompt_embed(prompt)
-        comp_image = self.get_composite_image(image)
-        image_to_grid(comp_image, 1).show()
+        # comp_image = self.get_composite_image(image)
+        # image_to_grid(comp_image, 1).show()
 
         optim = SGD(self.alpha_mask.parameters(), lr=lr)
-        for _ in tqdm(range(num_steps)):
+        for iter in tqdm(range(1, num_iters + 1)):
             reg_loss = self.get_alpha_reg_loss()
+            # prompt_embed = self.get_prompt_embed(prompt)
+
             comp_image = self.get_composite_image(image)
             score_distil_loss = self.get_score_distil_loss(
                 comp_image=comp_image, prompt_embed=prompt_embed,
             )
-            # loss = reg_loss + score_distil_loss
-            loss = score_distil_loss
+            loss = reg_coeff * reg_loss + score_distil_loss
+            # loss = score_distil_loss
+            # loss = 10000 * reg_loss
 
-            log = f"[ {reg_loss.item():.3f} ]"
-            log += f"[ {score_distil_loss.item():.3f} ]"
-            log += f"[ {loss.item():.3f} ]"
-            print(log)
+            if iter % (num_iters // 5) == 0:
+                log = f"[ {reg_loss.item():.2f} ]"
+                log += f"[ {score_distil_loss.item():.2f} ]"
+                log += f"[ {loss.item():.2f} ]"
+                print(log)
+                
+                image_to_grid(comp_image, 1).save("result.jpg")
 
             optim.zero_grad()
             loss.backward()
             optim.step()
-        # return self.alpha_mask.alpha
-        return self.get_composite_image(image)
+        # return self.alpha_mask.param
+        # return self.get_composite_image(image)
+        image_to_grid(comp_image, 1).save("result.jpg")
 
 
 if __name__ == "__main__":
-    device = torch.device("mps")
+    device = torch.device("cuda:0")
     torch_dtype = torch.float32
     sd = DiffusionPipeline.from_pretrained(
         "CompVis/stable-diffusion-v1-4",
@@ -192,10 +214,12 @@ if __name__ == "__main__":
     ).to(device)
     # unload_from_gpu(sd)
 
-    peekaboo = Peekaboo(sd)
-    img_path = "/Users/jongbeomkim/Desktop/workspace/Peekaboo/resources/harry_potter.webp"
+    img_path = "/home/jongbeomkim/Documents/workspace/Peekaboo/resources/harry_potter.webp"
     prompt = "Harry Potter"
+
+    peekaboo = Peekaboo(sd)
     comp_image = peekaboo.optimize(
-        img_path=img_path, prompt=prompt, num_steps=50, lr=0.00001,
+        img_path=img_path, prompt=prompt, reg_coeff=1000,
+        # num_iters=50, lr=0.00001,
     )
-    image_to_grid(comp_image, 1).show()
+    # image_to_grid(comp_image, 1).save("result.jpg")
